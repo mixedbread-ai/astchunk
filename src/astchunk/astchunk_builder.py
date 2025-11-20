@@ -13,6 +13,8 @@ import tree_sitter_go as tsgo
 import tree_sitter_html as tsh
 import tree_sitter_ruby as tsruby
 import tree_sitter_rust as tsrust
+import tree_sitter_php as tphp
+import tree_sitter_sql as tsql
 import pyrsistent
 
 from astchunk.astnode import ASTNode
@@ -55,6 +57,10 @@ class ASTChunkBuilder:
             self.parser = ts.Parser(ts.Language(tsruby.language()))
         elif self.language == "rust":
             self.parser = ts.Parser(ts.Language(tsrust.language()))
+        elif self.language == "php":
+            self.parser = ts.Parser(ts.Language(tphp.language()))
+        elif self.language == "sql":
+            self.parser = ts.Parser(ts.Language(tsql.language()))
         else:
             raise ValueError(f"Unsupported Programming Language: {self.language}!")
 

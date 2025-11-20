@@ -5,3 +5,6 @@ tree-sitter-python
 tree-sitter-java
 tree-sitter-c-sharp
 tree-sitter-typescript
+tree-sitter-php
+tree-sitter-sql
+tree-sitter-go
