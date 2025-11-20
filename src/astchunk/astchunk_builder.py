@@ -58,7 +58,7 @@ class ASTChunkBuilder:
         elif self.language == "rust":
             self.parser = ts.Parser(ts.Language(tsrust.language()))
         elif self.language == "php":
-            self.parser = ts.Parser(ts.Language(tphp.language()))
+            self.parser = ts.Parser(ts.Language(tphp.language_php()))
         elif self.language == "sql":
             self.parser = ts.Parser(ts.Language(tsql.language()))
         else:
