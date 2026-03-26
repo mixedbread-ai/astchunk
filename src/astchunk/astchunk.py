@@ -191,7 +191,10 @@ class ASTChunk():
         chunk_expansion += f"{self.chunk_expansion_metadata['ancestors']}\n" if self.chunk_expansion_metadata["ancestors"] else ""
         chunk_expansion += "'''"
 
-        self.chunk_text = f"{chunk_expansion}\n{self.chunk_text}"
+        expansion_size = get_nws_count_direct(chunk_expansion)
+        if self.chunk_size + expansion_size <= self.max_chunk_size:
+            self.chunk_text = f"{chunk_expansion}\n{self.chunk_text}"
+            self.chunk_size = get_nws_count_direct(self.chunk_text)
 
     def to_code_window(self) -> dict:
         """
