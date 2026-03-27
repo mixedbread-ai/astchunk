@@ -1,3 +1,4 @@
+import string
 import numpy as np
 from typing import Generator
 
@@ -19,7 +20,7 @@ import pyrsistent
 
 from astchunk.astnode import ASTNode
 from astchunk.astchunk import ASTChunk
-from astchunk.preprocessing import ByteRange, preprocess_nws_count, get_nws_count
+from astchunk.preprocessing import ByteRange, preprocess_nws_count, get_nws_count, get_nws_count_direct
 
 
 class ASTChunkBuilder:
@@ -161,6 +162,10 @@ class ASTChunkBuilder:
                     if child_windows:
                         # (optional) Greedily merge adjacent windows from the beginning if merged window does not exceed self.max_chunk_size
                         yield from self.merge_adjacent_windows(child_windows)
+                    else:
+                        # Leaf node that exceeds the limit — yield as single-node window.
+                        # The post-split step in chunkify() will text-split it to fit max_chunk_size.
+                        yield [ASTNode(node, node_size, ancestors)]
                 else:
                     # Node fits in an empty window
                     current_window.append(ASTNode(node, node_size, ancestors))
@@ -249,26 +254,38 @@ class ASTChunkBuilder:
         for i in range(len(ast_windows)):
             # Create a copy of the current window
             current_node_list = ast_windows[i].copy()
+            current_window_size = sum(n.size for n in current_node_list)
 
-            # If there is a previous window, prepend its last chunk_overlap elements
+            # If there is a previous window, prepend its last chunk_overlap elements (respecting max_chunk_size)
             if i > 0:
                 assert len(ast_windows[i - 1]) > 0, (
                     f"Attempting to take elements from an empty window at {i - 1}!"
                 )
                 prev_window = ast_windows[i - 1]
-                last_k_nodes = prev_window[-min(chunk_overlap, len(prev_window)) :]
-                # Insert at the beginning (prepending all elements)
-                current_node_list = last_k_nodes + current_node_list
+                candidates = prev_window[-min(chunk_overlap, len(prev_window)) :]
+                # Add nodes from the end of candidates (closest to current window) first
+                prepend_nodes = []
+                for node in reversed(candidates):
+                    if current_window_size + node.size <= self.max_chunk_size:
+                        prepend_nodes.insert(0, node)
+                        current_window_size += node.size
+                    else:
+                        break
+                current_node_list = prepend_nodes + current_node_list
 
-            # If there is a next window, append its first chunk_overlap elements
+            # If there is a next window, append its first chunk_overlap elements (respecting max_chunk_size)
             if i < len(ast_windows) - 1:
                 assert len(ast_windows[i + 1]) > 0, (
                     f"Attempting to take elements from an empty window at {i + 1}!"
                 )
                 next_window = ast_windows[i + 1]
-                first_k_nodes = next_window[: min(chunk_overlap, len(next_window))]
-                # Append all elements
-                current_node_list = current_node_list + first_k_nodes
+                candidates = next_window[: min(chunk_overlap, len(next_window))]
+                for node in candidates:
+                    if current_window_size + node.size <= self.max_chunk_size:
+                        current_node_list.append(node)
+                        current_window_size += node.size
+                    else:
+                        break
 
             new_code_windows.append(current_node_list)
 
@@ -342,6 +359,150 @@ class ASTChunkBuilder:
         return code_windows
 
     # ------------------------------ #
+    #            Step #5             #
+    # ------------------------------ #
+    def post_split_oversized_windows(self, code_windows: list[dict]) -> list[dict]:
+        """
+        Split any code windows that still exceed max_chunk_size using text-based splitting.
+
+        This acts as a final safety net for cases where a single AST leaf node (e.g., a large
+        string literal in minified/bundled code) exceeds the limit and cannot be split further
+        via AST decomposition. The text is split at line boundaries when possible, falling back
+        to character-level splitting for single lines that exceed the limit.
+
+        Args:
+            code_windows: A list of code windows (dicts with "content"/"text" and optional "metadata")
+
+        Returns:
+            A list of code windows where every window respects max_chunk_size
+        """
+        result = []
+        for window in code_windows:
+            content_key = "text" if "text" in window else "content"
+            content = window[content_key]
+
+            if get_nws_count_direct(content) <= self.max_chunk_size:
+                result.append(window)
+                continue
+
+            metadata = window.get("metadata", {})
+            start_line_no = metadata.get("start_line_no", 0)
+
+            # For swebench-lite format, the start line is embedded in _id (e.g. "instance_id_50-75")
+            if not metadata and "_id" in window:
+                try:
+                    line_range = window["_id"].rsplit("_", 1)[1]
+                    start_line_no = int(line_range.split("-")[0])
+                except (IndexError, ValueError):
+                    pass
+
+            base_id = None
+            if "_id" in window:
+                base_id = window["_id"].rsplit("_", 1)[0]
+
+            sub_parts = self._split_text_to_fit(content)
+            for piece_idx, (sub_text, line_offset, line_count) in enumerate(sub_parts):
+                sub_start = start_line_no + line_offset
+                sub_end = sub_start + line_count - 1
+                sub_window = {**window}
+                sub_window[content_key] = sub_text
+
+                if "metadata" in window:
+                    sub_window["metadata"] = {
+                        **metadata,
+                        "start_line_no": sub_start,
+                        "end_line_no": sub_end,
+                        "line_count": line_count,
+                        "chunk_size": get_nws_count_direct(sub_text),
+                    }
+
+                if base_id is not None:
+                    sub_window["_id"] = f"{base_id}_{sub_start}-{sub_end}-{piece_idx}"
+
+                result.append(sub_window)
+
+        return result
+
+    def _split_text_to_fit(self, text: str) -> list[tuple[str, int, int]]:
+        """
+        Split text into pieces where each has <= max_chunk_size non-whitespace characters.
+
+        Splits at line boundaries when possible, falling back to character-level
+        splitting for single lines that exceed the limit (e.g., minified code).
+
+        Args:
+            text: The text to split
+
+        Returns:
+            A list of (sub_text, line_offset, line_count) tuples where line_offset
+            is relative to the start of the input text
+        """
+        lines = text.split("\n")
+        result = []
+        current_lines = []
+        current_nws = 0
+        current_line_offset = 0
+
+        for line_idx, line in enumerate(lines):
+            line_nws = get_nws_count_direct(line)
+
+            if line_nws > self.max_chunk_size:
+                # Flush accumulated lines
+                if current_lines:
+                    result.append(("\n".join(current_lines), current_line_offset, len(current_lines)))
+                    current_lines = []
+                    current_nws = 0
+                # Character-level split — all pieces share same line number
+                for piece in self._split_long_line(line):
+                    result.append((piece, line_idx, 1))
+                current_line_offset = line_idx + 1
+            elif current_nws + line_nws > self.max_chunk_size:
+                # Flush current lines and start a new group
+                result.append(("\n".join(current_lines), current_line_offset, len(current_lines)))
+                current_lines = [line]
+                current_nws = line_nws
+                current_line_offset = line_idx
+            else:
+                if not current_lines:
+                    current_line_offset = line_idx
+                current_lines.append(line)
+                current_nws += line_nws
+
+        if current_lines:
+            result.append(("\n".join(current_lines), current_line_offset, len(current_lines)))
+
+        return result
+
+    def _split_long_line(self, line: str) -> list[str]:
+        """
+        Split a single line that exceeds max_chunk_size into pieces by non-whitespace character count.
+
+        Args:
+            line: A single line of text whose non-whitespace character count exceeds max_chunk_size
+
+        Returns:
+            A list of sub-strings, each with at most max_chunk_size non-whitespace characters
+        """
+        pieces = []
+        current = []
+        nws_count = 0
+
+        _whitespace = string.whitespace
+        for char in line:
+            current.append(char)
+            if char not in _whitespace:
+                nws_count += 1
+                if nws_count >= self.max_chunk_size:
+                    pieces.append("".join(current))
+                    current = []
+                    nws_count = 0
+
+        if current:
+            pieces.append("".join(current))
+
+        return pieces
+
+    # ------------------------------ #
     #       AST Chunking Logic       #
     # ------------------------------ #
     def chunkify(self, code: str, **configs) -> list[dict]:
@@ -378,5 +539,10 @@ class ASTChunkBuilder:
         # step 4: convert each ASTChunk to a code window for downstream integration
         code_windows = self.convert_chunks_to_code_windows(ast_chunks=ast_chunks)
         # [after this step]: list[dict] where each dict represents a code window
+
+        # step 5: post-split any oversized windows using text-based splitting
+        #         this handles cases where a single AST leaf node exceeds max_chunk_size
+        code_windows = self.post_split_oversized_windows(code_windows)
+        # [after this step]: list[dict] where each dict respects max_chunk_size
 
         return code_windows

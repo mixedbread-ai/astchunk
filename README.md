@@ -129,8 +129,8 @@ configs['chunk_overlap'] = 1
 # Add chunk expansion (metadata headers)
 configs['chunk_expansion'] = True
 
-# NOTE: max_chunk_size apply to the chunks before overlapping or chunk expansion.
-# The final chunk size after overlapping or chunk expansion may exceed max_chunk_size.
+# NOTE: max_chunk_size is strictly enforced. Overlapping nodes and chunk expansion
+# metadata are only added if they do not cause the chunk to exceed max_chunk_size.
 
 
 # Extend current code for illustration
